@@ -1,30 +1,66 @@
 package burp;
 
-public class TaboratorMessageEditorController implements IMessageEditorController {
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.http.HttpService;
+import burp.api.montoya.core.ByteArray;
 
-    private IHttpService httpService;
-    private byte[] request;
-    private byte[] response;
-    @Override
-    public IHttpService getHttpService() {
-        return httpService;
+public class TaboratorMessageEditorController {
+    private HttpRequestResponse httpRequestResponse;
+    private HttpRequest request;
+    private HttpResponse response;
+    private HttpService httpService;
+
+    public HttpRequestResponse getHttpRequestResponse() {
+        return httpRequestResponse;
     }
-    public void setHttpService(IHttpService httpService) {
-        this.httpService = httpService;
+    
+    public void setHttpRequestResponse(HttpRequestResponse httpRequestResponse) {
+        this.httpRequestResponse = httpRequestResponse;
+        if (httpRequestResponse != null) {
+            this.request = httpRequestResponse.request();
+            this.response = httpRequestResponse.response();
+            this.httpService = httpRequestResponse.request().httpService();
+        }
     }
 
-    @Override
-    public byte[] getRequest() {
+    public HttpRequest getRequest() {
         return request;
     }
-    public void setRequest(byte[] request) {
+    
+    public void setRequest(HttpRequest request) {
         this.request = request;
+        if (request != null) {
+            this.httpService = request.httpService();
+        }
     }
-    @Override
-    public byte[] getResponse() {
+    
+    public void setRequest(byte[] requestBytes) {
+        if (requestBytes != null) {
+            this.request = HttpRequest.httpRequest(ByteArray.byteArray(requestBytes));
+        }
+    }
+    
+    public HttpResponse getResponse() {
         return response;
     }
-    public void setResponse(byte[] response) {
+    
+    public void setResponse(HttpResponse response) {
         this.response = response;
+    }
+    
+    public void setResponse(byte[] responseBytes) {
+        if (responseBytes != null) {
+            this.response = HttpResponse.httpResponse(ByteArray.byteArray(responseBytes));
+        }
+    }
+    
+    public HttpService getHttpService() {
+        return httpService;
+    }
+    
+    public void setHttpService(HttpService httpService) {
+        this.httpService = httpService;
     }
 }

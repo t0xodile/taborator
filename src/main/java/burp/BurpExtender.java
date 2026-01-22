@@ -1,10 +1,27 @@
 package burp;
 
-import com.coreyd97.BurpExtenderUtilities.DefaultGsonProvider;
-import com.coreyd97.BurpExtenderUtilities.ILogProvider;
-import com.coreyd97.BurpExtenderUtilities.Preferences;
-import com.coreyd97.BurpExtenderUtilities.ProjectSettingStore;
-import com.google.gson.reflect.TypeToken;
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.collaborator.CollaboratorClient;
+import burp.api.montoya.collaborator.CollaboratorPayload;
+import burp.api.montoya.collaborator.Interaction;
+import burp.api.montoya.http.handler.HttpHandler;
+import burp.api.montoya.http.handler.HttpRequestToBeSent;
+import burp.api.montoya.http.handler.HttpResponseReceived;
+import burp.api.montoya.http.handler.RequestToBeSentAction;
+import burp.api.montoya.http.handler.ResponseReceivedAction;
+import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
+import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
+import burp.api.montoya.ui.hotkey.HotKey;
+import burp.api.montoya.ui.hotkey.HotKeyContext;
+import burp.api.montoya.ui.hotkey.HotKeyHandler;
+import burp.api.montoya.ui.hotkey.HotKeyEvent;
+import burp.api.montoya.ui.editor.HttpRequestEditor;
+import burp.api.montoya.ui.editor.HttpResponseEditor;
+import burp.api.montoya.ui.editor.RawEditor;
+import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.core.ByteArray;
 
 import javax.swing.*;
 import javax.swing.event.DocumentEvent;
@@ -24,20 +41,20 @@ import java.util.*;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.Base64;
 
-public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListener, IContextMenuFactory, IHttpListener {
+public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItemsProvider {
     private String extensionName = "Taborator";
     private String extensionVersion = "2.1.6";
     private int maxHashMapSize = 10000;
-    private IBurpExtenderCallbacks callbacks;
-    private IExtensionHelpers helpers;
+    private MontoyaApi api;
     private PrintWriter stderr;
     private PrintWriter stdout;
     private JPanel panel;
     private volatile boolean running;
     private int unread = 0;
     private ArrayList<Integer> readRows = new ArrayList<>();
-    private IBurpCollaboratorClientContext collaborator = null;
+    private CollaboratorClient collaborator = null;
     private HashMap<Integer, HashMap<String, String>> interactionHistory = new HashMap<>();
     private HashMap<String, HashMap<String,String>> originalRequests = new LimitedHashMap<>(maxHashMapSize);
     private HashMap<String, String> originalResponses = new LimitedHashMap<>(maxHashMapSize);
@@ -54,67 +71,52 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
     private int pollCounter = 0;
     private boolean shutdown = false;
     private boolean isSleeping = false;
-    private Preferences prefs;
+    private TaboratorSettings settings;
     private Integer rowNumber = 0;
     private DefaultTableModel model;
     private JTable collaboratorTable;
     private TableRowSorter<TableModel> sorter = null;
     private Color defaultTabColour;
-    public void registerExtenderCallbacks(final IBurpExtenderCallbacks callbacks) {
+    @Override
+    public void initialize(MontoyaApi api) {
         shutdown = false;
         isSleeping = false;
-        helpers = callbacks.getHelpers();
-        this.callbacks = callbacks;
-        callbacks.registerExtensionStateListener(this);
-        callbacks.registerContextMenuFactory(this);
-        callbacks.registerHttpListener(this);
-        stderr = new PrintWriter(callbacks.getStderr(), true);
-        stdout = new PrintWriter(callbacks.getStdout(), true);
-        callbacks.setExtensionName(extensionName);
+        this.api = api;
+        api.http().registerHttpHandler(this);
+        api.userInterface().registerContextMenuItemsProvider(this);
+        
+        // Register hotkeys for command palette
+
+        HotKey insertCollabPayload = HotKey.hotKey("Insert Collaborator Payload", "Ctrl+Shift+Alt+C");
+
+        HotKeyHandler insertCollabPayloadHandler = event -> event.messageEditorRequestResponse().ifPresent(editor -> {
+            insertCollaboratorPayload(event);
+        });
+
+        api.userInterface().registerHotKeyHandler(HotKeyContext.HTTP_MESSAGE_EDITOR, insertCollabPayload, insertCollabPayloadHandler);
+
+        HotKey insertCollabPlaceholder = HotKey.hotKey("Insert Placeholder", "Ctrl+Shift+Alt+P");
+
+        HotKeyHandler insertCollabPlaceholderHandler = event -> event.messageEditorRequestResponse().ifPresent(editor -> {
+            insertPlaceholder(event);
+        });
+
+        api.userInterface().registerHotKeyHandler(HotKeyContext.HTTP_MESSAGE_EDITOR, insertCollabPlaceholder, insertCollabPlaceholderHandler);
+
+        stderr = new PrintWriter(System.err, true);
+        stdout = new PrintWriter(System.out, true);
+        api.extension().setName(extensionName);
         defaultTabColour = getDefaultTabColour();
-        DefaultGsonProvider gsonProvider = new DefaultGsonProvider();
-
-        prefs = new Preferences("Taborator", gsonProvider, new ILogProvider() {
-            @Override
-            public void logOutput(String message) {
-                //System.out.println("Output:"+message);
-            }
-
-            @Override
-            public void logError(String errorMessage) {
-                System.err.println("Error Output:"+errorMessage);
-            }
-        }, callbacks);
+        settings = new TaboratorSettings(api);
         SwingUtilities.invokeLater(new Runnable() {
             public void run() {
-                stdout.println(extensionName + " " + extensionVersion);
-                stdout.println("To use Taborator right click in the repeater request tab and select \"Taborator->Insert Collaborator payload\". Use \"Taborator->Insert Collaborator placeholder\" to insert a placeholder that will be replaced by a Collaborator payload in every request. The Taborator placeholder also works in other Burp tools. You can also use the buttons in the Taborator tab to create a payload and poll now.");
+                api.logging().logToOutput(extensionName + " " + extensionVersion);
+                api.logging().logToOutput("To use Taborator right click in the repeater request tab and select \"Taborator->Insert Collaborator payload\". Use \"Taborator->Insert Collaborator placeholder\" to insert a placeholder that will be replaced by a Collaborator payload in every request. The Taborator placeholder also works in other Burp tools. You can also use the buttons in the Taborator tab to create a payload and poll now.");
                 running = true;
-                try {
-                    prefs.registerSetting("config", new TypeToken<HashMap<String, Integer>>() {
-                    }.getType(),new HashMap<>(),Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("readRows", new TypeToken<ArrayList<Integer>>() {
-                    }.getType(), new ArrayList<Integer>(), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("interactionHistory", new TypeToken<HashMap<Integer, HashMap<String, String>>>() {
-                    }.getType(), new HashMap<>(), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("originalRequests", new TypeToken<HashMap<String, HashMap<String, String>>>() {
-                    }.getType(), new LimitedHashMap<>(maxHashMapSize), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("originalResponses", new TypeToken<HashMap<String, String>>() {
-                    }.getType(), new LimitedHashMap<>(maxHashMapSize), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("comments", new TypeToken<HashMap<Integer, String>>() {
-                    }.getType(), new HashMap<>(), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("colours", new TypeToken<HashMap<Integer, Color>>() {
-                    }.getType(), new HashMap<>(), Preferences.Visibility.PROJECT);
-                    prefs.registerSetting("textColours", new TypeToken<HashMap<Integer, Color>>() {
-                    }.getType(), new HashMap<>(), Preferences.Visibility.PROJECT);
-                } catch(Throwable e) {
-                    System.err.println("Error registering settings:"+e);
-                }
                 panel = new JPanel(new BorderLayout());
                 JPanel topPanel = new JPanel();
                 topPanel.setLayout(new GridBagLayout());
                 JButton exportBtn = new JButton("Export");
-                exportBtn.setPreferredSize(new Dimension(80,30));
                 exportBtn.addActionListener(new ActionListener() {
                     @Override
                     public void actionPerformed(ActionEvent e) {
@@ -125,9 +127,9 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                         if (userSelection == JFileChooser.APPROVE_OPTION) {
                             File fileToSave = fileChooser.getSelectedFile();
                             String filePath = fileToSave.getAbsolutePath();
-                            ProjectSettingStore projectSettingStore = prefs.getProjectSettingsStore();
                             saveSettings();
-                            String jsonStr = projectSettingStore.getJSONSettings();
+                            // For export, we'll just export the interaction history as JSON
+                            String jsonStr = settings.getInteractionHistory().toString();
                             FileWriter file = null;
                             try {
                                 file = new FileWriter(filePath);
@@ -198,12 +200,11 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                     }
                 });
                 JButton createCollaboratorPayloadWithTaboratorCmd = new JButton("Taborator commands & copy");
-                createCollaboratorPayloadWithTaboratorCmd.setPreferredSize(new Dimension(200, 30));
                 createCollaboratorPayloadWithTaboratorCmd.addActionListener(new ActionListener() {
                     @Override
                     public void actionPerformed(ActionEvent e) {
                         createdCollaboratorPayload = true;
-                        String payload = collaborator.generatePayload(true) + "?TaboratorCmd=comment:Test;bgColour:0x000000;textColour:0xffffff";
+                        String payload = collaborator.generatePayload().toString() + "?TaboratorCmd=comment:Test;bgColour:0x000000;textColour:0xffffff";
                         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payload),null);
                     }
                 });
@@ -223,10 +224,10 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                             amount = 1;
                         }
                         StringBuilder payloads = new StringBuilder();
-                        payloads.append(collaborator.generatePayload(true));
+                        payloads.append(collaborator.generatePayload().toString());
                         for(int i=1;i<amount;i++) {
                             payloads.append("\n");
-                            payloads.append(collaborator.generatePayload(true));
+                            payloads.append(collaborator.generatePayload().toString());
                         }
                         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payloads.toString()),null);
                     }
@@ -240,9 +241,6 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                         }
                     }
                 });
-                pollButton.setPreferredSize(new Dimension(100, 30));
-                pollButton.setMaximumSize(new Dimension(180, 30));
-                exportBtn.setMaximumSize(new Dimension(100, 30));
                 topPanel.add(exportBtn, createConstraints(1, 2, 1, GridBagConstraints.NONE));
                 topPanel.add(searchText, createConstraints(2, 2, 1, GridBagConstraints.NONE));
                 topPanel.add(keywordSearch, createConstraints(3, 2, 1, GridBagConstraints.NONE));
@@ -250,8 +248,6 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                 topPanel.add(createCollaboratorPayloadWithTaboratorCmd, createConstraints(5, 2, 1, GridBagConstraints.NONE));
                 topPanel.add(pollButton, createConstraints(6, 2, 1, GridBagConstraints.NONE));
                 topPanel.add(generateMsg, createConstraints(7, 2, 1, GridBagConstraints.NONE));
-                createCollaboratorPayload.setPreferredSize(new Dimension(180, 30));
-                createCollaboratorPayload.setMaximumSize(new Dimension(180, 30));
                 topPanel.add(numberOfPayloads, createConstraints(8,2,1, GridBagConstraints.NONE));
                 topPanel.add(createCollaboratorPayload, createConstraints(9, 2, 1, GridBagConstraints.NONE));
                 panel.add(topPanel, BorderLayout.NORTH);
@@ -384,8 +380,8 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                 collaboratorClientSplit.setTopComponent(collaboratorScroll);
                 collaboratorClientSplit.setBottomComponent(new JPanel());
                 panel.add(collaboratorClientSplit, BorderLayout.CENTER);
-                callbacks.addSuiteTab(BurpExtender.this);
-                collaborator = callbacks.createBurpCollaboratorClientContext();
+                api.userInterface().registerSuiteTab(extensionName, panel);
+                collaborator = api.collaborator().createClient();
                 DefaultTableCellRenderer tableCellRender = new DefaultTableCellRenderer()
                 {
                     @Override
@@ -413,30 +409,30 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                                     TaboratorMessageEditorController taboratorMessageEditorController = new TaboratorMessageEditorController();
                                     description.setText("The Collaborator server received a DNS lookup of type " + interaction.get("query_type") + " for the hostname " + interaction.get("hostname") + "\n\n" +
                                             "The lookup was received from IP address " + interaction.get("client_ip") + " at " + interaction.get("time_stamp"));
-                                    IMessageEditor messageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
-                                    messageEditor.setMessage(helpers.base64Decode(interaction.get("raw_query")), false);
+                                    
+                                    RawEditor dnsQueryEditor = api.userInterface().createRawEditor();
+                                    dnsQueryEditor.setContents(ByteArray.byteArray(Base64.getDecoder().decode(interaction.get("raw_query"))));
+                                    
                                     if(originalRequests.containsKey(interaction.get("interaction_id"))) {
                                         HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        IHttpService httpService = helpers.buildHttpService(requestInfo.get("host"), Integer.decode(requestInfo.get("port")), requestInfo.get("protocol"));
-                                        taboratorMessageEditorController.setHttpService(httpService);
-                                        IMessageEditor requestMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
+                                        
                                         if (requestInfo.get("request") != null) {
-                                            requestMessageEditor.setMessage(helpers.stringToBytes(requestInfo.get("request")), true);
-                                            interactionsTab.addTab("Original request", requestMessageEditor.getComponent());
+                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
+                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
+                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
                                         }
                                         if (originalResponses.containsKey(interaction.get("interaction_id"))) {
-                                            taboratorMessageEditorController.setHttpService(httpService);
-                                            IMessageEditor responseMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
                                             if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
-                                                responseMessageEditor.setMessage(helpers.stringToBytes(originalResponses.get(interaction.get("interaction_id"))), true);
-                                                interactionsTab.addTab("Original response", responseMessageEditor.getComponent());
+                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
+                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
+                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
                                             }
                                         }
                                     }
-                                    interactionsTab.addTab("DNS query", messageEditor.getComponent());
+                                    interactionsTab.addTab("DNS query", dnsQueryEditor.uiComponent());
                                 } else if(interaction.get("type").equals("SMTP")) {
-                                    byte[] conversation = helpers.base64Decode(interaction.get("conversation"));
-                                    String conversationString = helpers.bytesToString(conversation);
+                                    byte[] conversation = Base64.getDecoder().decode(interaction.get("conversation"));
+                                    String conversationString = api.utilities().byteUtils().convertToString(conversation);
                                     String to = "";
                                     String from = "";
                                     String message = "";
@@ -460,69 +456,69 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                                                     "To: " + to + "\n\n" +
                                                     "Message: \n" + message
                                     );
-                                    IMessageEditor messageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
-                                    messageEditor.setMessage(conversation, false);
+                                    
+                                    RawEditor smtpConversationEditor = api.userInterface().createRawEditor();
+                                    smtpConversationEditor.setContents(ByteArray.byteArray(conversation));
+                                    
                                     if(originalRequests.containsKey(interaction.get("interaction_id"))) {
                                         HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        IHttpService httpService = helpers.buildHttpService(requestInfo.get("host"), Integer.decode(requestInfo.get("port")), requestInfo.get("protocol"));
-                                        taboratorMessageEditorController.setHttpService(httpService);
-                                        IMessageEditor requestMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
+                                        
                                         if (requestInfo.get("request") != null) {
-                                            requestMessageEditor.setMessage(helpers.stringToBytes(requestInfo.get("request")), true);
-                                            interactionsTab.addTab("Original request", requestMessageEditor.getComponent());
+                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
+                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
+                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
                                         }
                                         if (originalResponses.containsKey(interaction.get("interaction_id"))) {
-                                            taboratorMessageEditorController.setHttpService(httpService);
-                                            IMessageEditor responseMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
                                             if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
-                                                responseMessageEditor.setMessage(helpers.stringToBytes(originalResponses.get(interaction.get("interaction_id"))), true);
-                                                interactionsTab.addTab("Original response", responseMessageEditor.getComponent());
+                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
+                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
+                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
                                             }
                                         }
                                     }
-                                    interactionsTab.addTab("SMTP Conversation", messageEditor.getComponent());
+                                    interactionsTab.addTab("SMTP Conversation", smtpConversationEditor.uiComponent());
                                     interactionsTab.setSelectedIndex(1);
                                 } else if(interaction.get("type").equals("HTTP")) {
                                     TaboratorMessageEditorController taboratorMessageEditorController = new TaboratorMessageEditorController();
                                     URL collaboratorURL = null;
                                     try {
-                                        collaboratorURL = new URL(interaction.get("protocol").toLowerCase()+"://"+collaborator.getCollaboratorServerLocation());
+                                        collaboratorURL = new URL(interaction.get("protocol").toLowerCase()+"://"+collaborator.server().address());
                                     } catch (MalformedURLException e) {
                                         stderr.println("Failed parsing Collaborator URL:"+e.toString());
                                     }
                                     if(collaboratorURL != null) {
-                                        IHttpService httpService = helpers.buildHttpService(collaboratorURL.getHost(), collaboratorURL.getPort() == -1 ? collaboratorURL.getDefaultPort() : collaboratorURL.getPort(), interaction.get("protocol").equals("HTTPS"));
-                                        taboratorMessageEditorController.setHttpService(httpService);
+                                        // IHttpService httpService = helpers.buildHttpService(collaboratorURL.getHost(), collaboratorURL.getPort() == -1 ? collaboratorURL.getDefaultPort() : collaboratorURL.getPort(), interaction.get("protocol").equals("HTTPS"));
+                                        // taboratorMessageEditorController.setHttpService(httpService);
                                     }
-                                    byte[] collaboratorResponse = helpers.base64Decode(interaction.get("response"));
-                                    byte[] collaboratorRequest = helpers.base64Decode(interaction.get("request"));
-                                    taboratorMessageEditorController.setRequest(collaboratorRequest);
-                                    taboratorMessageEditorController.setResponse(collaboratorResponse);
+                                    byte[] collaboratorResponse = Base64.getDecoder().decode(interaction.get("response"));
+                                    byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
+                                    
                                     description.setText("The Collaborator server received an "+interaction.get("protocol")+" request.\n\nThe request was received from IP address "+interaction.get("client_ip")+" at "+interaction.get("time_stamp") + " for the hostname " + interaction.get("hostname"));
+                                    
                                     if(originalRequests.containsKey(interaction.get("interaction_id"))) {
                                         HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        IHttpService httpService = helpers.buildHttpService(requestInfo.get("host"), Integer.decode(requestInfo.get("port")), requestInfo.get("protocol"));
-                                        taboratorMessageEditorController.setHttpService(httpService);
-                                        IMessageEditor requestMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
+                                        
                                         if (requestInfo.get("request") != null) {
-                                            requestMessageEditor.setMessage(helpers.stringToBytes(requestInfo.get("request")), true);
-                                            interactionsTab.addTab("Original request", requestMessageEditor.getComponent());
+                                            HttpRequestEditor origRequestEditor = api.userInterface().createHttpRequestEditor();
+                                            origRequestEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
+                                            interactionsTab.addTab("Original request", origRequestEditor.uiComponent());
                                         }
                                         if (originalResponses.containsKey(interaction.get("interaction_id"))) {
-                                            taboratorMessageEditorController.setHttpService(httpService);
-                                            IMessageEditor responseMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
                                             if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
-                                                responseMessageEditor.setMessage(helpers.stringToBytes(originalResponses.get(interaction.get("interaction_id"))), true);
-                                                interactionsTab.addTab("Original response", responseMessageEditor.getComponent());
+                                                HttpResponseEditor origResponseEditor = api.userInterface().createHttpResponseEditor();
+                                                origResponseEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
+                                                interactionsTab.addTab("Original response", origResponseEditor.uiComponent());
                                             }
                                         }
                                     }
-                                    IMessageEditor requestMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
-                                    requestMessageEditor.setMessage(collaboratorRequest, true);
-                                    interactionsTab.addTab("Request to Collaborator", requestMessageEditor.getComponent());
-                                    IMessageEditor responseMessageEditor = callbacks.createMessageEditor(taboratorMessageEditorController, false);
-                                    responseMessageEditor.setMessage(collaboratorResponse, true);
-                                    interactionsTab.addTab("Response from Collaborator", responseMessageEditor.getComponent());
+                                    
+                                    HttpRequestEditor collabRequestEditor = api.userInterface().createHttpRequestEditor();
+                                    collabRequestEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest)));
+                                    interactionsTab.addTab("Request to Collaborator", collabRequestEditor.uiComponent());
+                                    
+                                    HttpResponseEditor collabResponseEditor = api.userInterface().createHttpResponseEditor();
+                                    collabResponseEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(collaboratorResponse)));
+                                    interactionsTab.addTab("Response from Collaborator", collabResponseEditor.uiComponent());
                                     interactionsTab.setSelectedIndex(1);
                                 }
                                 description.setBorder(BorderFactory.createCompoundBorder(description.getBorder(), BorderFactory.createEmptyBorder(10, 10, 10, 10)));
@@ -583,7 +579,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
 
                         while(running){
                             if(pollNow) {
-                                List<IBurpCollaboratorInteraction> interactions = collaborator.fetchAllCollaboratorInteractions();
+                                List<Interaction> interactions = collaborator.getAllInteractions();
                                 if(interactions.size() > 0) {
                                     insertInteractions(interactions);
                                 }
@@ -628,31 +624,31 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
             }
         }
         if (interaction.get("type").equals("HTTP")) {
-            byte[] collaboratorRequest = helpers.base64Decode(interaction.get("request"));
-            if (helpers.indexOf(collaboratorRequest, helpers.stringToBytes("TaboratorCmd="), true, 0, collaboratorRequest.length) > -1) {
-                IRequestInfo analyzedRequest = helpers.analyzeRequest(collaboratorRequest);
-                List<IParameter> params = analyzedRequest.getParameters();
-                for (int i = 0; i < params.size(); i++) {
-                    if (params.get(i).getName().equals("TaboratorCmd")) {
-                        String[] commands = params.get(i).getValue().split(";");
+            byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
+            if (api.utilities().byteUtils().indexOf(collaboratorRequest, api.utilities().byteUtils().convertFromString("TaboratorCmd="), true, 0, collaboratorRequest.length) > -1) {
+                var analyzedRequest = HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest));
+                var params = analyzedRequest.parameters();
+                for (var param : params) {
+                    if (param.name().equals("TaboratorCmd")) {
+                        String[] commands = param.value().split(";");
                         for (int j = 0; j < commands.length; j++) {
                             String[] command = commands[j].split(":");
                             if (command[0].equals("bgColour")) {
                                 try {
-                                    Color colour = Color.decode(helpers.urlDecode(command[1]));
+                                    Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
                                     colours.put(rowID, colour);
                                 } catch (NumberFormatException e) {
 
                                 }
                             } else if (command[0].equals("textColour")) {
                                 try {
-                                    Color colour = Color.decode(helpers.urlDecode(command[1]));
+                                    Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
                                     textColours.put(rowID, colour);
                                 } catch (NumberFormatException e) {
 
                                 }
                             } else if (command[0].equals("comment")) {
-                                String comment = helpers.urlDecode(command[1]);
+                                String comment = api.utilities().urlUtils().decode(command[1]);
                                 int actualID = getRealRowID(rowID);
                                 if(actualID > -1) {
                                     model.setValueAt(comment, actualID, 5);
@@ -677,49 +673,58 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
     }
     private void loadSettings() {
         try {
-            HashMap<String,Integer> config = prefs.getSetting("config");
-            if(config.size() > 0) {
-                unread = config.get("unread");
-                rowNumber = config.get("rowNumber");
-            }
-            interactionHistory = prefs.getSetting("interactionHistory");
-            originalRequests = prefs.getSetting("originalRequests");
-            originalResponses = prefs.getSetting("originalResponses");
-            comments = prefs.getSetting("comments");
-            colours = prefs.getSetting("colours");
-            textColours = prefs.getSetting("textColours");
-            readRows = prefs.getSetting("readRows");
+            unread = settings.getUnread();
+            rowNumber = settings.getRowNumber();
+            interactionHistory = settings.getInteractionHistory();
+            originalRequests = settings.getOriginalRequests();
+            originalResponses = settings.getOriginalResponses();
+            comments = settings.getComments();
+            colours = settings.getColours();
+            textColours = settings.getTextColours();
+            readRows = settings.getReadRows();
         } catch(Throwable e) {
             System.err.println("Error reading settings:"+e);
         }
     }
+    
     private void saveSettings() {
         try {
-            HashMap<String,Integer> config = new HashMap<>();
-            config.put("unread", unread);
-            config.put("rowNumber", rowNumber);
-            prefs.setSetting("config", config);
-            prefs.setSetting("interactionHistory", interactionHistory);
-            prefs.setSetting("originalRequests", originalRequests);
-            prefs.setSetting("originalResponses", originalResponses);
-            prefs.setSetting("readRows", readRows);
-            prefs.setSetting("comments", comments);
-            prefs.setSetting("colours", colours);
-            prefs.setSetting("textColours", textColours);
+            settings.saveSettings(unread, rowNumber, interactionHistory, originalRequests, 
+                               originalResponses, readRows, comments, colours, textColours);
         } catch (Throwable e) {
             System.err.println("Error saving settings:"+e);
         }
     }
-    private void insertInteractions(List<IBurpCollaboratorInteraction> interactions) {
+    private void insertInteractions(List<Interaction> interactions) {
         boolean hasInteractions = false;
         for(int i=0;i<interactions.size();i++) {
-            IBurpCollaboratorInteraction interaction =  interactions.get(i);
+            Interaction interaction = interactions.get(i);
             HashMap<String, String> interactionHistoryItem = new HashMap<>();
             rowNumber++;
             int rowID = rowNumber;
-            for (Map.Entry<String,String> interactionData : interaction.getProperties().entrySet()) {
-                interactionHistoryItem.put(interactionData.getKey(), interactionData.getValue());
+            // Convert new Interaction to legacy format for existing code compatibility
+            interactionHistoryItem.put("interaction_id", interaction.id().toString());
+            interactionHistoryItem.put("type", interaction.type().toString());
+            interactionHistoryItem.put("time_stamp", interaction.timeStamp().toString());
+            interactionHistoryItem.put("client_ip", interaction.clientIp().getHostAddress());
+            
+            // Add specific details based on interaction type
+            if (interaction.dnsDetails().isPresent()) {
+                var dnsDetails = interaction.dnsDetails().get();
+                interactionHistoryItem.put("raw_query", Base64.getEncoder().encodeToString(dnsDetails.query().getBytes()));
+                interactionHistoryItem.put("query_type", dnsDetails.queryType().toString());
             }
+            if (interaction.httpDetails().isPresent()) {
+                var httpDetails = interaction.httpDetails().get();
+                interactionHistoryItem.put("request", Base64.getEncoder().encodeToString(httpDetails.requestResponse().request().toByteArray().getBytes()));
+                interactionHistoryItem.put("response", Base64.getEncoder().encodeToString(httpDetails.requestResponse().response().toByteArray().getBytes()));
+                interactionHistoryItem.put("protocol", httpDetails.requestResponse().request().httpService().secure() ? "HTTPS" : "HTTP");
+            }
+            if (interaction.smtpDetails().isPresent()) {
+                var smtpDetails = interaction.smtpDetails().get();
+                interactionHistoryItem.put("conversation", Base64.getEncoder().encodeToString(smtpDetails.conversation().getBytes()));
+            }
+            
             interactionHistoryItem.put("hostname", getHostnameFromInteraction(interactionHistoryItem));
             insertInteraction(interactionHistoryItem, rowID);
             unread++;
@@ -728,11 +733,10 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         }
         updateTab(hasInteractions);
     }
-    @Override
+    // These methods are no longer needed with Montoya API
     public Component getUiComponent() {
         return panel;
     }
-    @Override
     public String getTabCaption() {
         return unread > 0 ? extensionName + " ("+unread+")" : extensionName;
     }
@@ -747,7 +751,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
     private Color getDefaultTabColour() {
         if(running) {
             JTabbedPane tp = (JTabbedPane) BurpExtender.this.getUiComponent().getParent();
-            int tIndex = getTabIndex(BurpExtender.this);
+            int tIndex = getTabIndex();
             if (tIndex > -1) {
                 return tp.getBackgroundAt(tIndex);
             }
@@ -758,7 +762,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
     private void updateTab(boolean hasInteractions) {
         if(running) {
             JTabbedPane tp = (JTabbedPane) BurpExtender.this.getUiComponent().getParent();
-            int tIndex = getTabIndex(BurpExtender.this);
+            int tIndex = getTabIndex();
             if (tIndex > -1) {
                 tp.setTitleAt(tIndex, getTabCaption());
                 changeTabColour(tp, tIndex, hasInteractions);
@@ -766,9 +770,9 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         }
     }
 
-    private int getTabIndex(ITab your_itab) {
+    private int getTabIndex() {
         if(running) {
-            JTabbedPane parent = (JTabbedPane) your_itab.getUiComponent().getParent();
+            JTabbedPane parent = (JTabbedPane) panel.getParent();
             for (int i = 0; i < parent.getTabCount(); ++i) {
                 if (parent.getTitleAt(i).contains(extensionName)) {
                     return i;
@@ -827,44 +831,54 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         return splitter;
     }
 
-    public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
-        if(messageIsRequest) {
-            byte[] request = messageInfo.getRequest();
-            if (helpers.indexOf(request, helpers.stringToBytes(COLLABORATOR_PLACEHOLDER), true, 0, request.length) > -1) {
-                String requestStr = helpers.bytesToString(request);
-                Matcher m = Pattern.compile(COLLABORATOR_PLACEHOLDER.replace("$", "\\$")).matcher(requestStr);
-                ArrayList<String> collaboratorPayloads = new ArrayList<>();
-                while (m.find()) {
-                    String collaboratorPayloadID = collaborator.generatePayload(false);
-                    collaboratorPayloads.add(collaboratorPayloadID);
-                    requestStr = requestStr.replaceFirst(COLLABORATOR_PLACEHOLDER.replace("$", "\\$"), collaboratorPayloadID + "." + collaborator.getCollaboratorServerLocation());
-                    pollNow = true;
-                    createdCollaboratorPayload = true;
-                }
-                request = helpers.stringToBytes(requestStr);
-                request = fixContentLength(request);
-                messageInfo.setRequest(request);
-
-                for (int i = 0; i < collaboratorPayloads.size(); i++) {
-                    HashMap<String, String> originalRequestsInfo = new HashMap<>();
-                    originalRequestsInfo.put("request", helpers.bytesToString(request));
-                    originalRequestsInfo.put("host", messageInfo.getHttpService().getHost());
-                    originalRequestsInfo.put("port", Integer.toString(messageInfo.getHttpService().getPort()));
-                    originalRequestsInfo.put("protocol", messageInfo.getHttpService().getProtocol());
-                    originalRequests.put(collaboratorPayloads.get(i), originalRequestsInfo);
-                }
+    @Override
+    public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
+        byte[] request = requestToBeSent.toByteArray().getBytes();
+        if (api.utilities().byteUtils().indexOf(request, api.utilities().byteUtils().convertFromString(COLLABORATOR_PLACEHOLDER), true, 0, request.length) > -1) {
+            String requestStr = api.utilities().byteUtils().convertToString(request);
+            Matcher m = Pattern.compile(COLLABORATOR_PLACEHOLDER.replace("$", "\\$")).matcher(requestStr);
+            ArrayList<String> collaboratorPayloads = new ArrayList<>();
+            while (m.find()) {
+                String collaboratorPayloadID = collaborator.generatePayload().id().toString();
+                collaboratorPayloads.add(collaboratorPayloadID);
+                String replacement = collaboratorPayloadID + "." + collaborator.server().address();
+                requestStr = requestStr.replaceFirst(COLLABORATOR_PLACEHOLDER.replace("$", "\\$"), replacement);
+                pollNow = true;
+                createdCollaboratorPayload = true;
             }
-        } else {
-            byte[] response = messageInfo.getResponse();
-            byte[] request = messageInfo.getRequest();
-            for (Map.Entry<String, HashMap<String, String>> entry : originalRequests.entrySet()) {
-                String payload = entry.getKey();
-                if(!originalResponses.containsKey(payload) && helpers.indexOf(request,helpers.stringToBytes(payload), true, 0, request.length) > -1) {
-                    originalResponses.put(payload, helpers.bytesToString(response));
-                }
+            request = api.utilities().byteUtils().convertFromString(requestStr);
+            request = fixContentLength(request);
+
+            for (int i = 0; i < collaboratorPayloads.size(); i++) {
+                HashMap<String, String> originalRequestsInfo = new HashMap<>();
+                originalRequestsInfo.put("request", api.utilities().byteUtils().convertToString(request));
+                originalRequestsInfo.put("host", requestToBeSent.httpService().host());
+                originalRequestsInfo.put("port", Integer.toString(requestToBeSent.httpService().port()));
+                originalRequestsInfo.put("protocol", requestToBeSent.httpService().secure() ? "https" : "http");
+                originalRequests.put(collaboratorPayloads.get(i), originalRequestsInfo);
+            }
+            
+            // Create new request while preserving the original HTTP service
+            var httpService = requestToBeSent.httpService();
+            var newRequest = HttpRequest.httpRequest(httpService, ByteArray.byteArray(request));
+            return RequestToBeSentAction.continueWith(newRequest);
+        }
+        return RequestToBeSentAction.continueWith(requestToBeSent);
+    }
+    
+    @Override
+    public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived responseReceived) {
+        byte[] response = responseReceived.toByteArray().getBytes();
+        byte[] request = responseReceived.initiatingRequest().toByteArray().getBytes();
+        for (Map.Entry<String, HashMap<String, String>> entry : originalRequests.entrySet()) {
+            String payload = entry.getKey();
+            if(!originalResponses.containsKey(payload) && api.utilities().byteUtils().indexOf(request, api.utilities().byteUtils().convertFromString(payload), true, 0, request.length) > -1) {
+                originalResponses.put(payload, api.utilities().byteUtils().convertToString(response));
             }
         }
+        return ResponseReceivedAction.continueWith(responseReceived);
     }
+
     private GridBagConstraints createConstraints(int x, int y, int gridWidth, int fill) {
         GridBagConstraints c = new GridBagConstraints();
         c.fill = fill;
@@ -879,9 +893,9 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         return c;
     }
     public byte[] fixContentLength(byte[] request) {
-        IRequestInfo analyzedRequest = helpers.analyzeRequest(request);
-        if (countMatches(request, helpers.stringToBytes("Content-Length: ")) > 0) {
-            int start = analyzedRequest.getBodyOffset();
+        var analyzedRequest = HttpRequest.httpRequest(ByteArray.byteArray(request));
+        if (countMatches(request, api.utilities().byteUtils().convertFromString("Content-Length: ")) > 0) {
+            int start = analyzedRequest.bodyOffset();
             int contentLength = request.length - start;
             return setHeader(request, "Content-Length", Integer.toString(contentLength));
         }
@@ -905,7 +919,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
                 break;
             }
 
-            String header_str = helpers.bytesToString(header_name);
+            String header_str = new String(header_name);
 
             if (header.equals(header_str)) {
                 int[] offsets = {line_start, headerValueStart, i - 2};
@@ -924,7 +938,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         try {
             outputStream.write( Arrays.copyOfRange(request, 0, offsets[1]));
-            outputStream.write(helpers.stringToBytes(value));
+            outputStream.write(value.getBytes());
             outputStream.write(Arrays.copyOfRange(request, offsets[2], request.length));
             return outputStream.toByteArray();
         } catch (IOException e) {
@@ -942,7 +956,7 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
 
         int start = 0;
         while (start < response.length) {
-            start = helpers.indexOf(response, match, true, start, response.length);
+            start = api.utilities().byteUtils().indexOf(response, match, true, start, response.length);
             if (start == -1)
                 break;
             matches += 1;
@@ -953,14 +967,14 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
     }
 
     private String getHostnameFromInteraction(HashMap<String, String> interaction) {
-        String fallback = interaction.get("interaction_id") + "." + collaborator.getCollaboratorServerLocation();
+        String fallback = interaction.get("interaction_id") + "." + collaborator.server().address();
         switch(interaction.get("type")) {
             case "DNS":
-                return getHostnameFromDnsRequest(helpers.base64Decode(interaction.get("raw_query")), fallback);
+                return getHostnameFromDnsRequest(Base64.getDecoder().decode(interaction.get("raw_query")), fallback);
             case "HTTP":
-                return getHostnameFromHttpRequest(helpers.bytesToString(helpers.base64Decode(interaction.get("request"))), fallback);
+                return getHostnameFromHttpRequest(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("request"))), fallback);
             case "SMTP":
-                return getHostnameFromSmtpConversation(helpers.bytesToString(helpers.base64Decode(interaction.get("conversation"))), fallback);
+                return getHostnameFromSmtpConversation(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("conversation"))), fallback);
             default:
                 return fallback;
         }
@@ -1068,60 +1082,173 @@ public class BurpExtender implements IBurpExtender, ITab, IExtensionStateListene
         return fallback;
     }
 
-    public List<JMenuItem> createMenuItems(IContextMenuInvocation invocation) {
-        int[] bounds = invocation.getSelectionBounds();
-
-        switch (invocation.getInvocationContext()) {
-            case IContextMenuInvocation.CONTEXT_MESSAGE_EDITOR_REQUEST:
-                break;
-            default:
-                return null;
+    @Override
+    public List<Component> provideMenuItems(ContextMenuEvent event) {
+        List<Component> menu = new ArrayList<>();
+        
+        // Show context menu for message editors and request/response viewers
+        if (event.messageEditorRequestResponse().isPresent() || !event.selectedRequestResponses().isEmpty()) {
+            JMenu submenu = new JMenu(extensionName);
+            
+            JMenuItem createPayload = new JMenuItem("Insert Collaborator payload");
+            createPayload.addActionListener(e -> {
+                String payload = collaborator.generatePayload().toString();
+                insertTextIntoEditor(event, payload);
+                pollNow = true;
+                createdCollaboratorPayload = true;
+            });
+            
+            JMenuItem createPlaceholder = new JMenuItem("Insert Collaborator placeholder");
+            createPlaceholder.addActionListener(e -> {
+                insertTextIntoEditor(event, COLLABORATOR_PLACEHOLDER);
+                pollNow = true;
+                createdCollaboratorPayload = true;
+            });
+            
+            submenu.add(createPayload);
+            submenu.add(createPlaceholder);
+            menu.add(submenu);
         }
-        List<JMenuItem> menu = new ArrayList<JMenuItem>();
-        JMenu submenu = new JMenu(extensionName);
-        JMenuItem createPayload = new JMenuItem("Insert Collaborator payload");
-        createPayload.addActionListener(e -> {
-            if(invocation.getInvocationContext() == IContextMenuInvocation.CONTEXT_MESSAGE_EDITOR_REQUEST || invocation.getInvocationContext() == IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_REQUEST) {
-                byte[] message = invocation.getSelectedMessages()[0].getRequest();
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(message, 0, bounds[0]));
-                    outputStream.write(helpers.stringToBytes(collaborator.generatePayload(true)));
-                    outputStream.write(Arrays.copyOfRange(message, bounds[1],message.length));
-                    outputStream.flush();
-                    invocation.getSelectedMessages()[0].setRequest(outputStream.toByteArray());
-                    pollNow = true;
-                    createdCollaboratorPayload = true;
-                } catch (IOException e1) {
-                    System.err.println(e1.toString());
-                }
-            }
-        });
-        JMenuItem createPlaceholder = new JMenuItem("Insert Collaborator placeholder");
-        createPlaceholder.addActionListener(e -> {
-            if(invocation.getInvocationContext() == IContextMenuInvocation.CONTEXT_MESSAGE_EDITOR_REQUEST || invocation.getInvocationContext() == IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_REQUEST) {
-                byte[] message = invocation.getSelectedMessages()[0].getRequest();
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(message, 0, bounds[0]));
-                    outputStream.write(helpers.stringToBytes(COLLABORATOR_PLACEHOLDER));
-                    outputStream.write(Arrays.copyOfRange(message, bounds[1],message.length));
-                    outputStream.flush();
-                    invocation.getSelectedMessages()[0].setRequest(outputStream.toByteArray());
-                    pollNow = true;
-                    createdCollaboratorPayload = true;
-                } catch (IOException e1) {
-                    System.err.println(e1.toString());
-                }
-            }
-        });
-        submenu.add(createPayload);
-        submenu.add(createPlaceholder);
-        menu.add(submenu);
+        
         return menu;
     }
+    
+    private void insertTextIntoEditor(Object event, String textToInsert) {
+        // Handle message editor context (like Repeater request tab)
+        if (event instanceof ContextMenuEvent && ((ContextMenuEvent) event).messageEditorRequestResponse().isPresent()) {
+            var messageEditor = ((ContextMenuEvent) event).messageEditorRequestResponse().get();
+            
+            // Get current request
+            var currentRequest = messageEditor.requestResponse().request();
+            var currentRequestBytes = currentRequest.toByteArray().getBytes();
+            
+            // Check if there's a selection
+            var selection = messageEditor.selectionOffsets();
+            byte[] modifiedRequest;
+            
+            if (selection.isPresent() && selection.get().startIndexInclusive() != selection.get().endIndexExclusive()) {
+                // There's actual selected text - replace it
+                var selectionRange = selection.get();
+                int startOffset = selectionRange.startIndexInclusive();
+                int endOffset = selectionRange.endIndexExclusive();
+                
+                // Create new request with text inserted/replaced
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                try {
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, startOffset));
+                    outputStream.write(textToInsert.getBytes());
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
+                    modifiedRequest = outputStream.toByteArray();
+                } catch (Exception ex) {
+                    stderr.println("Error inserting text at selection: " + ex.getMessage());
+                    // Fallback: copy to clipboard
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+                    return;
+                }
+            } else {
+                // No selection or empty selection - insert at cursor position
+                int caretPosition = messageEditor.caretPosition();
+                
+                // Make sure caret position is within bounds
+                if (caretPosition < 0) caretPosition = 0;
+                if (caretPosition > currentRequestBytes.length) caretPosition = currentRequestBytes.length;
+                
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                try {
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, caretPosition));
+                    outputStream.write(textToInsert.getBytes());
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
+                    modifiedRequest = outputStream.toByteArray();
+                } catch (Exception ex) {
+                    stderr.println("Error inserting text at cursor position: " + ex.getMessage());
+                    // Fallback: copy to clipboard
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+                    return;
+                }
+            }
+            
+            // Create new request and set it back
+            var newRequest = HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest));
+            messageEditor.setRequest(newRequest);
+            
+        } else if (event instanceof HotKeyEvent && ((HotKeyEvent) event).messageEditorRequestResponse().isPresent()) {
+            var messageEditor = ((HotKeyEvent) event).messageEditorRequestResponse().get();
+            
+            // Get current request
+            var currentRequest = messageEditor.requestResponse().request();
+            var currentRequestBytes = currentRequest.toByteArray().getBytes();
+            
+            // Check if there's a selection
+            var selection = messageEditor.selectionOffsets();
+            byte[] modifiedRequest;
+            
+            if (selection.isPresent() && selection.get().startIndexInclusive() != selection.get().endIndexExclusive()) {
+                // There's actual selected text - replace it
+                var selectionRange = selection.get();
+                int startOffset = selectionRange.startIndexInclusive();
+                int endOffset = selectionRange.endIndexExclusive();
+                
+                // Create new request with text inserted/replaced
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                try {
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, startOffset));
+                    outputStream.write(textToInsert.getBytes());
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
+                    modifiedRequest = outputStream.toByteArray();
+                } catch (Exception ex) {
+                    stderr.println("Error inserting text at selection: " + ex.getMessage());
+                    // Fallback: copy to clipboard
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+                    return;
+                }
+            } else {
+                // No selection or empty selection - insert at cursor position
+                int caretPosition = messageEditor.caretPosition();
+                
+                // Make sure caret position is within bounds
+                if (caretPosition < 0) caretPosition = 0;
+                if (caretPosition > currentRequestBytes.length) caretPosition = currentRequestBytes.length;
+                
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                try {
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, caretPosition));
+                    outputStream.write(textToInsert.getBytes());
+                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
+                    modifiedRequest = outputStream.toByteArray();
+                } catch (Exception ex) {
+                    stderr.println("Error inserting text at cursor position: " + ex.getMessage());
+                    // Fallback: copy to clipboard
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+                    return;
+                }
+            }
+            
+            // Create new request and set it back
+            var newRequest = HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest));
+            messageEditor.setRequest(newRequest);
+        } else {
+            // Fallback: copy to clipboard for other contexts
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+        }
+    }
 
-    @Override
+    private void insertCollaboratorPayload(HotKeyEvent event) {
+        // For now, simply copy to clipboard as fallback
+        CollaboratorPayload collaboratorPayload = collaborator.generatePayload();
+        String insertText = collaboratorPayload.toString();
+
+        insertTextIntoEditor(event, insertText);
+        pollNow = true;
+        createdCollaboratorPayload = true;
+    }
+
+    private void insertPlaceholder(HotKeyEvent event) {
+        // For now, simply copy to clipboard as fallback
+        String insertText = COLLABORATOR_PLACEHOLDER;
+        insertTextIntoEditor(event, insertText);
+    }
+
+    // Extension cleanup is handled automatically by Montoya API
     public void extensionUnloaded() {
         shutdown = true;
         running = false;
