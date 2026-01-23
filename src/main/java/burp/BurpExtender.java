@@ -584,14 +584,11 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         });
     }
     private void insertInteraction(HashMap<String,String> interaction, int rowID) {
-        model.addRow(new Object[]{rowID,interaction.get("time_stamp"), interaction.get("type"), interaction.get("client_ip"), interaction.get("hostname"), ""});
-        if(comments.size() > 0) {
-            int actualID = getRealRowID(rowID);
-            if(actualID > -1 && comments.containsKey(actualID)) {
-                String comment = comments.get(actualID);
-                model.setValueAt(comment, actualID, 5);
-            }
-        }
+        // Parse TaboratorCmd before GUI update to extract colors/comments
+        Color bgColour = null;
+        Color txtColour = null;
+        String commentFromCmd = null;
+
         if (interaction.get("type").equals("HTTP") && interaction.get("request") != null) {
             try {
                 byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
@@ -608,24 +605,18 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                                 }
                                 if (command[0].equals("bgColour")) {
                                     try {
-                                        Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
-                                        colours.put(rowID, colour);
+                                        bgColour = Color.decode(api.utilities().urlUtils().decode(command[1]));
                                     } catch (NumberFormatException e) {
                                         // Invalid color format, skip
                                     }
                                 } else if (command[0].equals("textColour")) {
                                     try {
-                                        Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
-                                        textColours.put(rowID, colour);
+                                        txtColour = Color.decode(api.utilities().urlUtils().decode(command[1]));
                                     } catch (NumberFormatException e) {
                                         // Invalid color format, skip
                                     }
                                 } else if (command[0].equals("comment")) {
-                                    String comment = api.utilities().urlUtils().decode(command[1]);
-                                    int actualID = getRealRowID(rowID);
-                                    if(actualID > -1) {
-                                        model.setValueAt(comment, actualID, 5);
-                                    }
+                                    commentFromCmd = api.utilities().urlUtils().decode(command[1]);
                                 }
                             }
                             break;
@@ -636,6 +627,33 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 api.logging().logToError("Failed to decode HTTP request for TaboratorCmd: " + e.getMessage());
             }
         }
+
+        // Store colors in thread-safe maps (ConcurrentHashMap)
+        if (bgColour != null) {
+            colours.put(rowID, bgColour);
+        }
+        if (txtColour != null) {
+            textColours.put(rowID, txtColour);
+        }
+
+        // Perform GUI updates on EDT
+        final String finalCommentFromCmd = commentFromCmd;
+        SwingUtilities.invokeLater(() -> {
+            model.addRow(new Object[]{rowID, interaction.get("time_stamp"), interaction.get("type"), interaction.get("client_ip"), interaction.get("hostname"), ""});
+            if(comments.size() > 0) {
+                int actualID = getRealRowID(rowID);
+                if(actualID > -1 && comments.containsKey(actualID)) {
+                    String comment = comments.get(actualID);
+                    model.setValueAt(comment, actualID, 5);
+                }
+            }
+            if (finalCommentFromCmd != null) {
+                int actualID = getRealRowID(rowID);
+                if(actualID > -1) {
+                    model.setValueAt(finalCommentFromCmd, actualID, 5);
+                }
+            }
+        });
     }
     private int getRealRowID(int rowID) {
         int rowCount = collaboratorTable.getRowCount();
@@ -737,11 +755,18 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
     }
     private void updateTab(boolean hasInteractions) {
         if(running) {
-            JTabbedPane tp = (JTabbedPane) BurpExtender.this.getUiComponent().getParent();
-            int tIndex = getTabIndex();
-            if (tIndex > -1) {
-                tp.setTitleAt(tIndex, getTabCaption());
-                changeTabColour(tp, tIndex, hasInteractions);
+            Runnable updateRunnable = () -> {
+                JTabbedPane tp = (JTabbedPane) BurpExtender.this.getUiComponent().getParent();
+                int tIndex = getTabIndex();
+                if (tIndex > -1) {
+                    tp.setTitleAt(tIndex, getTabCaption());
+                    changeTabColour(tp, tIndex, hasInteractions);
+                }
+            };
+            if (SwingUtilities.isEventDispatchThread()) {
+                updateRunnable.run();
+            } else {
+                SwingUtilities.invokeLater(updateRunnable);
             }
         }
     }

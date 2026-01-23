@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This is a Burp Suite Extension template project using the Montoya API (currently a minimal starter project).
+This is a Burp Suite Extension that adds a new "taborator" tab. This tab is like the collaborator tool, with extra functionality. The core difference is that it attaches the original request/response that triggered a collaborator callback to the taborator interactions. 
 
 ## Architecture
 
@@ -34,4 +34,4 @@ The built JAR file will be in `build/libs/` and can be loaded directly into Burp
 
 ## Current State
 
-This is a template project with minimal functionality. The main extension class currently only sets the extension name to "My Extension" and contains a TODO for actual implementation
+Montoya API rewrite of the original taborator. 
