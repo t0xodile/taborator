@@ -34,43 +34,50 @@ import java.awt.*;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.*;
 import java.io.*;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.nio.*;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.Base64;
 
 public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItemsProvider {
     private String extensionName = "Taborator";
     private String extensionVersion = "2.1.6";
     private int maxHashMapSize = 10000;
     private MontoyaApi api;
-    private PrintWriter stderr;
-    private PrintWriter stdout;
     private JPanel panel;
     private volatile boolean running;
     private int unread = 0;
     private ArrayList<Integer> readRows = new ArrayList<>();
     private CollaboratorClient collaborator = null;
-    private HashMap<Integer, HashMap<String, String>> interactionHistory = new HashMap<>();
-    private HashMap<String, HashMap<String,String>> originalRequests = new LimitedHashMap<>(maxHashMapSize);
-    private HashMap<String, String> originalResponses = new LimitedHashMap<>(maxHashMapSize);
+    private Map<Integer, HashMap<String, String>> interactionHistory = new ConcurrentHashMap<>();
+    private Map<String, HashMap<String, String>> originalRequests = new ConcurrentHashMap<>();
+    private Map<String, String> originalResponses = new ConcurrentHashMap<>();
     private JTabbedPane interactionsTab;
     private Integer selectedRow = -1;
-    private HashMap<Integer, Color> colours = new HashMap<>();
-    private HashMap<Integer, Color> textColours = new HashMap<>();
-    private HashMap<Integer, String> comments = new HashMap<>();
+    private Map<Integer, Color> colours = new ConcurrentHashMap<>();
+    private Map<Integer, Color> textColours = new ConcurrentHashMap<>();
+    private Map<Integer, String> comments = new ConcurrentHashMap<>();
     private static final String COLLABORATOR_PLACEHOLDER = "$collabplz";
+    private static final Pattern COLLABORATOR_PLACEHOLDER_PATTERN = Pattern.compile(COLLABORATOR_PLACEHOLDER.replace("$", "\\$"));
+    private static final Pattern SMTP_RCPT_TO_PATTERN = Pattern.compile("^RCPT TO:(.+?)$", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+    private static final Pattern SMTP_MAIL_FROM_PATTERN = Pattern.compile("^MAIL From:(.+)?$", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+    private static final Pattern SMTP_DATA_PATTERN = Pattern.compile("^DATA[\\r\\n]+([\\d\\D]+)?[\\r\\n]+[.][\\r\\n]+", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
+    private static final Pattern BRACKETED_ADDRESS_PATTERN = Pattern.compile("<(.*)>");
     private Thread pollThread;
     private long POLL_EVERY_MS = 10000;
     private boolean pollNow = false;
     private boolean createdCollaboratorPayload = false;
     private int pollCounter = 0;
-    private boolean shutdown = false;
-    private boolean isSleeping = false;
+    private volatile boolean shutdown = false;
+    private volatile boolean isSleeping = false;
     private TaboratorSettings settings;
     private Integer rowNumber = 0;
     private DefaultTableModel model;
@@ -103,13 +110,11 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
 
         api.userInterface().registerHotKeyHandler(HotKeyContext.HTTP_MESSAGE_EDITOR, insertCollabPlaceholder, insertCollabPlaceholderHandler);
 
-        stderr = new PrintWriter(System.err, true);
-        stdout = new PrintWriter(System.out, true);
         api.extension().setName(extensionName);
+        api.extension().registerUnloadingHandler(this::extensionUnloaded);
         defaultTabColour = getDefaultTabColour();
         settings = new TaboratorSettings(api);
-        SwingUtilities.invokeLater(new Runnable() {
-            public void run() {
+        SwingUtilities.invokeLater(() -> {
                 api.logging().logToOutput(extensionName + " " + extensionVersion);
                 api.logging().logToOutput("To use Taborator right click in the repeater request tab and select \"Taborator->Insert Collaborator payload\". Use \"Taborator->Insert Collaborator placeholder\" to insert a placeholder that will be replaced by a Collaborator payload in every request. The Taborator placeholder also works in other Burp tools. You can also use the buttons in the Taborator tab to create a payload and poll now.");
                 running = true;
@@ -117,47 +122,34 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 JPanel topPanel = new JPanel();
                 topPanel.setLayout(new GridBagLayout());
                 JButton exportBtn = new JButton("Export");
-                exportBtn.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        JFrame frame = new JFrame();
-                        JFileChooser fileChooser = new JFileChooser();
-                        fileChooser.setDialogTitle("Please choose where to save interactions");
-                        int userSelection = fileChooser.showSaveDialog(frame);
-                        if (userSelection == JFileChooser.APPROVE_OPTION) {
-                            File fileToSave = fileChooser.getSelectedFile();
-                            String filePath = fileToSave.getAbsolutePath();
-                            saveSettings();
-                            // For export, we'll just export the interaction history as JSON
-                            String jsonStr = settings.getInteractionHistory().toString();
-                            FileWriter file = null;
-                            try {
-                                file = new FileWriter(filePath);
-                                file.write(jsonStr);
-                            } catch (IOException ex) {
-                                ex.printStackTrace();
-                            } finally {
-                                try {
-                                    file.flush();
-                                    file.close();
-                                } catch (IOException ex) {
-                                    ex.printStackTrace();
-                                }
-                            }
+                exportBtn.addActionListener(e -> {
+                    Frame parentFrame = api.userInterface().swingUtils().suiteFrame();
+                    JFileChooser fileChooser = new JFileChooser();
+                    fileChooser.setDialogTitle("Please choose where to save interactions");
+                    int userSelection = fileChooser.showSaveDialog(parentFrame);
+                    if (userSelection == JFileChooser.APPROVE_OPTION) {
+                        File fileToSave = fileChooser.getSelectedFile();
+                        String filePath = fileToSave.getAbsolutePath();
+                        saveSettings();
+                        String jsonStr = settings.getInteractionHistory().toString();
+                        try (FileWriter file = new FileWriter(filePath)) {
+                            file.write(jsonStr);
+                        } catch (IOException ex) {
+                            api.logging().logToError("Failed to export interactions: " + ex.getMessage());
                         }
                     }
                 });
                 JLabel searchText = new JLabel("Search (IP,Host):");
                 JTextField keywordSearch = new JTextField();
                 keywordSearch.setPreferredSize(new Dimension(160, 30));
-                JComboBox filter = new JComboBox();
+                JComboBox<String> filter = new JComboBox<>();
                 filter.setPreferredSize(new Dimension(160, 30));
                 filter.addItem("Show all types");
                 filter.addItem("DNS");
                 filter.addItem("HTTP");
                 filter.addItem("SMTP");
 
-                RowFilter rowFilter = new RowFilter<TableModel,Integer>() {
+                RowFilter<TableModel, Integer> rowFilter = new RowFilter<>() {
                     @Override
                     public boolean include(RowFilter.Entry<? extends TableModel,? extends Integer> row) {
                         String keyword = keywordSearch.getText();
@@ -177,12 +169,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                         }
                     }
                 };
-                filter.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        sorter.setRowFilter(rowFilter);
-                    }
-                });
+                filter.addActionListener(e -> sorter.setRowFilter(rowFilter));
                 keywordSearch.getDocument().addDocumentListener(new DocumentListener() {
                     @Override
                     public void insertUpdate(DocumentEvent e) {
@@ -200,45 +187,36 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                     }
                 });
                 JButton createCollaboratorPayloadWithTaboratorCmd = new JButton("Taborator commands & copy");
-                createCollaboratorPayloadWithTaboratorCmd.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        createdCollaboratorPayload = true;
-                        String payload = collaborator.generatePayload().toString() + "?TaboratorCmd=comment:Test;bgColour:0x000000;textColour:0xffffff";
-                        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payload),null);
-                    }
+                createCollaboratorPayloadWithTaboratorCmd.addActionListener(e -> {
+                    createdCollaboratorPayload = true;
+                    String payload = collaborator.generatePayload().toString() + "?TaboratorCmd=comment:Test;bgColour:0x000000;textColour:0xffffff";
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payload), null);
                 });
                 JLabel generateMsg = new JLabel("Number to generate:");
                 JButton pollButton = new JButton("Poll now");
                 JTextField numberOfPayloads = new JTextField("1");
                 numberOfPayloads.setPreferredSize(new Dimension(50, 30));
                 JButton createCollaboratorPayload = new JButton("Create payload & copy");
-                createCollaboratorPayload.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        createdCollaboratorPayload = true;
-                        int amount = 1;
-                        try {
-                            amount = Integer.parseInt(numberOfPayloads.getText());
-                        } catch (NumberFormatException ex) {
-                            amount = 1;
-                        }
-                        StringBuilder payloads = new StringBuilder();
-                        payloads.append(collaborator.generatePayload().toString());
-                        for(int i=1;i<amount;i++) {
-                            payloads.append("\n");
-                            payloads.append(collaborator.generatePayload().toString());
-                        }
-                        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payloads.toString()),null);
+                createCollaboratorPayload.addActionListener(e -> {
+                    createdCollaboratorPayload = true;
+                    int amount = 1;
+                    try {
+                        amount = Integer.parseInt(numberOfPayloads.getText());
+                    } catch (NumberFormatException ex) {
+                        amount = 1;
                     }
+                    StringBuilder payloads = new StringBuilder();
+                    payloads.append(collaborator.generatePayload().toString());
+                    for (int i = 1; i < amount; i++) {
+                        payloads.append("\n");
+                        payloads.append(collaborator.generatePayload().toString());
+                    }
+                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(payloads.toString()), null);
                 });
-                pollButton.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        pollNow = true;
-                        if(isSleeping) {
-                            pollThread.interrupt();
-                        }
+                pollButton.addActionListener(e -> {
+                    pollNow = true;
+                    if (isSleeping) {
+                        pollThread.interrupt();
                     }
                 });
                 topPanel.add(exportBtn, createConstraints(1, 2, 1, GridBagConstraints.NONE));
@@ -260,7 +238,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 interactionsTab = new JTabbedPane();
                 JSplitPane collaboratorClientSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
                 collaboratorClientSplit.setResizeWeight(.5d);
-                final Class[] classes = new Class[]{Integer.class, Long.class, String.class, String.class, String.class, String.class};
+                final Class<?>[] classes = new Class<?>[]{Integer.class, Long.class, String.class, String.class, String.class, String.class};
                 model = new DefaultTableModel() {
                     @Override
                     public boolean isCellEditable(int row, int column) {
@@ -288,18 +266,15 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 collaboratorTable.getColumnModel().getColumn(2).setMaxWidth(80);
                 JPopupMenu popupMenu = new JPopupMenu();
                 JMenuItem commentMenuItem = new JMenuItem("Add comment");
-                commentMenuItem.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        int rowNum = collaboratorTable.getSelectedRow();
-                        if(rowNum > -1) {
-                            int realRowNum = collaboratorTable.convertRowIndexToModel(rowNum);
-                            String comment = JOptionPane.showInputDialog("Please enter a comment");
+                commentMenuItem.addActionListener(e -> {
+                    int rowNum = collaboratorTable.getSelectedRow();
+                    if (rowNum > -1) {
+                        int realRowNum = collaboratorTable.convertRowIndexToModel(rowNum);
+                        String comment = JOptionPane.showInputDialog(api.userInterface().swingUtils().suiteFrame(), "Please enter a comment");
+                        if (comment != null) {
                             collaboratorTable.getModel().setValueAt(comment, realRowNum, 5);
-                            if(comment.length() == 0) {
-                                if(comments.containsKey(realRowNum)) {
-                                    comments.remove(realRowNum);
-                                }
+                            if (comment.isEmpty()) {
+                                comments.remove(realRowNum);
                             } else {
                                 comments.put(realRowNum, comment);
                             }
@@ -320,55 +295,45 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 highlightMenu.add(generateMenuItem(collaboratorTable, Color.decode("0xb1b1b1"), "HTTP", Color.black));
                 popupMenu.add(highlightMenu);
                 JMenuItem markReadMenuItem = new JMenuItem("Mark all as read");
-                markReadMenuItem.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        int answer = JOptionPane.showConfirmDialog(null,"This will mark all interactions as read, are you sure?");
-                        TableModel model = (DefaultTableModel) collaboratorTable.getModel();
-                        if(answer == 0) {
-                            readRows = new ArrayList<>();
-                            for(int i=0;i<model.getRowCount() + 1;i++) {
-                                readRows.add(i);
-                            }
-                            unread = 0;
-                            updateTab(false);
-                            collaboratorTable.repaint();
+                markReadMenuItem.addActionListener(e -> {
+                    int answer = JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(), "This will mark all interactions as read, are you sure?");
+                    if (answer == JOptionPane.YES_OPTION) {
+                        TableModel tableModel = collaboratorTable.getModel();
+                        readRows = new ArrayList<>();
+                        for (int i = 0; i < tableModel.getRowCount() + 1; i++) {
+                            readRows.add(i);
                         }
+                        unread = 0;
+                        updateTab(false);
+                        collaboratorTable.repaint();
                     }
                 });
                 JMenuItem clearMenuItem = new JMenuItem("Clear interactions");
-                clearMenuItem.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        int answer = JOptionPane.showConfirmDialog(null,"This will clear all interactions, are you sure?");
-                        TableModel model = (DefaultTableModel) collaboratorTable.getModel();
-                        if(answer == 0) {
-                            interactionHistory = new HashMap<>();
-                            readRows = new ArrayList<>();
-                            unread = 0;
-                            rowNumber = 0;
-                            colours = new HashMap<>();
-                            textColours = new HashMap<>();
-                            comments = new HashMap<>();
-                            ((DefaultTableModel) model).setRowCount(0);
-                            interactionsTab.removeAll();
-                            selectedRow = -1;
-                            updateTab(false);
-                        }
-                        collaboratorTable.clearSelection();
+                clearMenuItem.addActionListener(e -> {
+                    int answer = JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(), "This will clear all interactions, are you sure?");
+                    if (answer == JOptionPane.YES_OPTION) {
+                        interactionHistory.clear();
+                        readRows.clear();
+                        unread = 0;
+                        rowNumber = 0;
+                        colours.clear();
+                        textColours.clear();
+                        comments.clear();
+                        model.setRowCount(0);
+                        interactionsTab.removeAll();
+                        selectedRow = -1;
+                        updateTab(false);
                     }
+                    collaboratorTable.clearSelection();
                 });
                 JMenuItem clearOriginalReqResItem = new JMenuItem("Clear original requests/responses");
-                clearOriginalReqResItem.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        int answer = JOptionPane.showConfirmDialog(null,"This will remove all req/res history from placeholder usage, are you sure?");
-                        if(answer == 0) {
-                            originalRequests = new LimitedHashMap<>(maxHashMapSize);
-                            originalResponses = new LimitedHashMap<>(maxHashMapSize);
-                        }
-                        collaboratorTable.clearSelection();
+                clearOriginalReqResItem.addActionListener(e -> {
+                    int answer = JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(), "This will remove all req/res history from placeholder usage, are you sure?");
+                    if (answer == JOptionPane.YES_OPTION) {
+                        originalRequests.clear();
+                        originalResponses.clear();
                     }
+                    collaboratorTable.clearSelection();
                 });
                 popupMenu.add(clearOriginalReqResItem);
                 popupMenu.add(clearMenuItem);
@@ -406,98 +371,91 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                                 interactionsTab.removeAll();
                                 interactionsTab.addTab("Description", descriptionPanel);
                                 if(interaction.get("type").equals("DNS")) {
-                                    TaboratorMessageEditorController taboratorMessageEditorController = new TaboratorMessageEditorController();
                                     description.setText("The Collaborator server received a DNS lookup of type " + interaction.get("query_type") + " for the hostname " + interaction.get("hostname") + "\n\n" +
                                             "The lookup was received from IP address " + interaction.get("client_ip") + " at " + interaction.get("time_stamp"));
-                                    
-                                    RawEditor dnsQueryEditor = api.userInterface().createRawEditor();
-                                    dnsQueryEditor.setContents(ByteArray.byteArray(Base64.getDecoder().decode(interaction.get("raw_query"))));
-                                    
-                                    if(originalRequests.containsKey(interaction.get("interaction_id"))) {
-                                        HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        
-                                        if (requestInfo.get("request") != null) {
-                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
-                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
-                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
-                                        }
-                                        if (originalResponses.containsKey(interaction.get("interaction_id"))) {
-                                            if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
-                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
-                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
-                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
-                                            }
-                                        }
-                                    }
-                                    interactionsTab.addTab("DNS query", dnsQueryEditor.uiComponent());
-                                } else if(interaction.get("type").equals("SMTP")) {
-                                    byte[] conversation = Base64.getDecoder().decode(interaction.get("conversation"));
-                                    String conversationString = api.utilities().byteUtils().convertToString(conversation);
-                                    String to = "";
-                                    String from = "";
-                                    String message = "";
-                                    Matcher m = Pattern.compile("^RCPT TO:(.+?)$", Pattern.CASE_INSENSITIVE + Pattern.MULTILINE).matcher(conversationString);
-                                    if(m.find()) {
-                                        to = m.group(1).trim();
-                                    }
-                                    m = Pattern.compile("^MAIL From:(.+)?$", Pattern.CASE_INSENSITIVE + Pattern.MULTILINE).matcher(conversationString);
-                                    if(m.find()) {
-                                        from = m.group(1).trim();
-                                    }
-                                    m = Pattern.compile("^DATA[\\r\\n]+([\\d\\D]+)?[\\r\\n]+[.][\\r\\n]+", Pattern.CASE_INSENSITIVE + Pattern.MULTILINE).matcher(conversationString);
-                                    if(m.find()) {
-                                        message = m.group(1).trim();
-                                    }
-                                    TaboratorMessageEditorController taboratorMessageEditorController = new TaboratorMessageEditorController();
-                                    description.setText(
-                                            "The Collaborator server received a SMTP connection from IP address " + interaction.get("client_ip") + " at " + interaction.get("time_stamp") + ".\n\n" +
-                                                    "The email details were:\n\n" +
-                                                    "From: " + from + "\n\n" +
-                                                    "To: " + to + "\n\n" +
-                                                    "Message: \n" + message
-                                    );
-                                    
-                                    RawEditor smtpConversationEditor = api.userInterface().createRawEditor();
-                                    smtpConversationEditor.setContents(ByteArray.byteArray(conversation));
-                                    
-                                    if(originalRequests.containsKey(interaction.get("interaction_id"))) {
-                                        HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        
-                                        if (requestInfo.get("request") != null) {
-                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
-                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
-                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
-                                        }
-                                        if (originalResponses.containsKey(interaction.get("interaction_id"))) {
-                                            if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
-                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
-                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
-                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
-                                            }
-                                        }
-                                    }
-                                    interactionsTab.addTab("SMTP Conversation", smtpConversationEditor.uiComponent());
-                                    interactionsTab.setSelectedIndex(1);
-                                } else if(interaction.get("type").equals("HTTP")) {
-                                    TaboratorMessageEditorController taboratorMessageEditorController = new TaboratorMessageEditorController();
-                                    URL collaboratorURL = null;
+
                                     try {
-                                        collaboratorURL = new URL(interaction.get("protocol").toLowerCase()+"://"+collaborator.server().address());
-                                    } catch (MalformedURLException e) {
-                                        stderr.println("Failed parsing Collaborator URL:"+e.toString());
+                                        RawEditor dnsQueryEditor = api.userInterface().createRawEditor();
+                                        dnsQueryEditor.setContents(ByteArray.byteArray(Base64.getDecoder().decode(interaction.get("raw_query"))));
+                                        interactionsTab.addTab("DNS query", dnsQueryEditor.uiComponent());
+                                    } catch (IllegalArgumentException e) {
+                                        api.logging().logToError("Failed to decode DNS query: " + e.getMessage());
                                     }
-                                    if(collaboratorURL != null) {
-                                        // IHttpService httpService = helpers.buildHttpService(collaboratorURL.getHost(), collaboratorURL.getPort() == -1 ? collaboratorURL.getDefaultPort() : collaboratorURL.getPort(), interaction.get("protocol").equals("HTTPS"));
-                                        // taboratorMessageEditorController.setHttpService(httpService);
-                                    }
-                                    byte[] collaboratorResponse = Base64.getDecoder().decode(interaction.get("response"));
-                                    byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
-                                    
-                                    description.setText("The Collaborator server received an "+interaction.get("protocol")+" request.\n\nThe request was received from IP address "+interaction.get("client_ip")+" at "+interaction.get("time_stamp") + " for the hostname " + interaction.get("hostname"));
-                                    
+
                                     if(originalRequests.containsKey(interaction.get("interaction_id"))) {
                                         HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
-                                        
+
+                                        if (requestInfo.get("request") != null) {
+                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
+                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
+                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
+                                        }
+                                        if (originalResponses.containsKey(interaction.get("interaction_id"))) {
+                                            if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
+                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
+                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
+                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
+                                            }
+                                        }
+                                    }
+                                } else if(interaction.get("type").equals("SMTP")) {
+                                    try {
+                                        byte[] conversation = Base64.getDecoder().decode(interaction.get("conversation"));
+                                        String conversationString = api.utilities().byteUtils().convertToString(conversation);
+                                        String to = "";
+                                        String from = "";
+                                        String message = "";
+                                        Matcher m = SMTP_RCPT_TO_PATTERN.matcher(conversationString);
+                                        if(m.find()) {
+                                            to = m.group(1).trim();
+                                        }
+                                        m = SMTP_MAIL_FROM_PATTERN.matcher(conversationString);
+                                        if(m.find()) {
+                                            from = m.group(1).trim();
+                                        }
+                                        m = SMTP_DATA_PATTERN.matcher(conversationString);
+                                        if(m.find()) {
+                                            message = m.group(1).trim();
+                                        }
+                                        description.setText(
+                                                "The Collaborator server received a SMTP connection from IP address " + interaction.get("client_ip") + " at " + interaction.get("time_stamp") + ".\n\n" +
+                                                        "The email details were:\n\n" +
+                                                        "From: " + from + "\n\n" +
+                                                        "To: " + to + "\n\n" +
+                                                        "Message: \n" + message
+                                        );
+
+                                        RawEditor smtpConversationEditor = api.userInterface().createRawEditor();
+                                        smtpConversationEditor.setContents(ByteArray.byteArray(conversation));
+                                        interactionsTab.addTab("SMTP Conversation", smtpConversationEditor.uiComponent());
+                                        interactionsTab.setSelectedIndex(1);
+                                    } catch (IllegalArgumentException e) {
+                                        description.setText("The Collaborator server received a SMTP connection from IP address " + interaction.get("client_ip") + " at " + interaction.get("time_stamp") + ".\n\nError decoding conversation data.");
+                                        api.logging().logToError("Failed to decode SMTP conversation: " + e.getMessage());
+                                    }
+
+                                    if(originalRequests.containsKey(interaction.get("interaction_id"))) {
+                                        HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
+
+                                        if (requestInfo.get("request") != null) {
+                                            HttpRequestEditor requestMessageEditor = api.userInterface().createHttpRequestEditor();
+                                            requestMessageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
+                                            interactionsTab.addTab("Original request", requestMessageEditor.uiComponent());
+                                        }
+                                        if (originalResponses.containsKey(interaction.get("interaction_id"))) {
+                                            if (requestInfo.get("request") != null && originalResponses.get(interaction.get("interaction_id")) != null) {
+                                                HttpResponseEditor responseMessageEditor = api.userInterface().createHttpResponseEditor();
+                                                responseMessageEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(originalResponses.get(interaction.get("interaction_id")).getBytes())));
+                                                interactionsTab.addTab("Original response", responseMessageEditor.uiComponent());
+                                            }
+                                        }
+                                    }
+                                } else if(interaction.get("type").equals("HTTP")) {
+                                    description.setText("The Collaborator server received an "+interaction.get("protocol")+" request.\n\nThe request was received from IP address "+interaction.get("client_ip")+" at "+interaction.get("time_stamp") + " for the hostname " + interaction.get("hostname"));
+
+                                    if(originalRequests.containsKey(interaction.get("interaction_id"))) {
+                                        HashMap<String, String> requestInfo = originalRequests.get(interaction.get("interaction_id"));
+
                                         if (requestInfo.get("request") != null) {
                                             HttpRequestEditor origRequestEditor = api.userInterface().createHttpRequestEditor();
                                             origRequestEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(requestInfo.get("request").getBytes())));
@@ -511,15 +469,22 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                                             }
                                         }
                                     }
-                                    
-                                    HttpRequestEditor collabRequestEditor = api.userInterface().createHttpRequestEditor();
-                                    collabRequestEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest)));
-                                    interactionsTab.addTab("Request to Collaborator", collabRequestEditor.uiComponent());
-                                    
-                                    HttpResponseEditor collabResponseEditor = api.userInterface().createHttpResponseEditor();
-                                    collabResponseEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(collaboratorResponse)));
-                                    interactionsTab.addTab("Response from Collaborator", collabResponseEditor.uiComponent());
-                                    interactionsTab.setSelectedIndex(1);
+
+                                    try {
+                                        byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
+                                        byte[] collaboratorResponse = Base64.getDecoder().decode(interaction.get("response"));
+
+                                        HttpRequestEditor collabRequestEditor = api.userInterface().createHttpRequestEditor();
+                                        collabRequestEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest)));
+                                        interactionsTab.addTab("Request to Collaborator", collabRequestEditor.uiComponent());
+
+                                        HttpResponseEditor collabResponseEditor = api.userInterface().createHttpResponseEditor();
+                                        collabResponseEditor.setResponse(HttpResponse.httpResponse(ByteArray.byteArray(collaboratorResponse)));
+                                        interactionsTab.addTab("Response from Collaborator", collabResponseEditor.uiComponent());
+                                        interactionsTab.setSelectedIndex(1);
+                                    } catch (IllegalArgumentException e) {
+                                        api.logging().logToError("Failed to decode HTTP request/response: " + e.getMessage());
+                                    }
                                 }
                                 description.setBorder(BorderFactory.createCompoundBorder(description.getBorder(), BorderFactory.createEmptyBorder(10, 10, 10, 10)));
                                 descriptionPanel.add(description);
@@ -564,54 +529,58 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 };
                 collaboratorTable.setDefaultRenderer(Object.class, tableCellRender);
                 collaboratorTable.setDefaultRenderer(Number.class, tableCellRender);
-                Runnable collaboratorRunnable = new Runnable() {
-                    public void run() {
-                        stdout.println("Taborator running...");
-                        loadSettings();
-                        for (Map.Entry<Integer, HashMap<String, String>> data : interactionHistory.entrySet()) {
-                            int id = data.getKey();
-                            HashMap<String, String> interaction = data.getValue();
-                            insertInteraction(interaction, id);
-                        }
-                        if(unread > 0) {
-                            updateTab(true);
-                        }
-
-                        while(running){
-                            if(pollNow) {
-                                List<Interaction> interactions = collaborator.getAllInteractions();
-                                if(interactions.size() > 0) {
-                                    insertInteractions(interactions);
-                                }
-                                pollNow = false;
+                Runnable collaboratorRunnable = () -> {
+                        try {
+                            api.logging().logToOutput("Taborator running...");
+                            loadSettings();
+                            for (Map.Entry<Integer, HashMap<String, String>> data : interactionHistory.entrySet()) {
+                                int id = data.getKey();
+                                HashMap<String, String> interaction = data.getValue();
+                                insertInteraction(interaction, id);
                             }
-                            try {
-                                isSleeping = true;
-                                pollThread.sleep(POLL_EVERY_MS);
-                                isSleeping = false;
-                                pollCounter++;
-                                if(pollCounter > 5) {
-                                    if(createdCollaboratorPayload) {
-                                        pollNow = true;
+                            if(unread > 0) {
+                                updateTab(true);
+                            }
+
+                            while(running){
+                                if(pollNow) {
+                                    List<Interaction> interactions = collaborator.getAllInteractions();
+                                    if(interactions.size() > 0) {
+                                        insertInteractions(interactions);
                                     }
-                                    pollCounter = 0;
+                                    pollNow = false;
                                 }
-                            } catch (InterruptedException e) {
-                                if(shutdown) {
-                                    stdout.println("Taborator shutdown.");
-                                    return;
-                                } else {
-                                    continue;
-                                }
+                                try {
+                                    isSleeping = true;
+                                    Thread.sleep(POLL_EVERY_MS);
+                                    isSleeping = false;
+                                    pollCounter++;
+                                    if(pollCounter > 5) {
+                                        if(createdCollaboratorPayload) {
+                                            pollNow = true;
+                                        }
+                                        pollCounter = 0;
+                                    }
+                                } catch (InterruptedException e) {
+                                    if(shutdown) {
+                                        api.logging().logToOutput("Taborator shutdown.");
+                                        return;
+                                    } else {
+                                        continue;
+                                    }
 
+                                }
                             }
+                            api.logging().logToOutput("Taborator shutdown.");
+                        } catch (Exception e) {
+                            api.logging().logToError("Taborator background thread error: " + e.getMessage());
+                            StringWriter sw = new StringWriter();
+                            e.printStackTrace(new PrintWriter(sw));
+                            api.logging().logToError(sw.toString());
                         }
-                        stdout.println("Taborator shutdown.");
-                    }
                 };
                 pollThread = new Thread(collaboratorRunnable);
                 pollThread.start();
-            }
         });
     }
     private void insertInteraction(HashMap<String,String> interaction, int rowID) {
@@ -623,41 +592,48 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                 model.setValueAt(comment, actualID, 5);
             }
         }
-        if (interaction.get("type").equals("HTTP")) {
-            byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
-            if (api.utilities().byteUtils().indexOf(collaboratorRequest, api.utilities().byteUtils().convertFromString("TaboratorCmd="), true, 0, collaboratorRequest.length) > -1) {
-                var analyzedRequest = HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest));
-                var params = analyzedRequest.parameters();
-                for (var param : params) {
-                    if (param.name().equals("TaboratorCmd")) {
-                        String[] commands = param.value().split(";");
-                        for (int j = 0; j < commands.length; j++) {
-                            String[] command = commands[j].split(":");
-                            if (command[0].equals("bgColour")) {
-                                try {
-                                    Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
-                                    colours.put(rowID, colour);
-                                } catch (NumberFormatException e) {
-
+        if (interaction.get("type").equals("HTTP") && interaction.get("request") != null) {
+            try {
+                byte[] collaboratorRequest = Base64.getDecoder().decode(interaction.get("request"));
+                if (api.utilities().byteUtils().indexOf(collaboratorRequest, api.utilities().byteUtils().convertFromString("TaboratorCmd="), true, 0, collaboratorRequest.length) > -1) {
+                    var analyzedRequest = HttpRequest.httpRequest(ByteArray.byteArray(collaboratorRequest));
+                    var params = analyzedRequest.parameters();
+                    for (var param : params) {
+                        if (param.name().equals("TaboratorCmd")) {
+                            String[] commands = param.value().split(";");
+                            for (int j = 0; j < commands.length; j++) {
+                                String[] command = commands[j].split(":", 2);
+                                if (command.length < 2) {
+                                    continue;
                                 }
-                            } else if (command[0].equals("textColour")) {
-                                try {
-                                    Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
-                                    textColours.put(rowID, colour);
-                                } catch (NumberFormatException e) {
-
-                                }
-                            } else if (command[0].equals("comment")) {
-                                String comment = api.utilities().urlUtils().decode(command[1]);
-                                int actualID = getRealRowID(rowID);
-                                if(actualID > -1) {
-                                    model.setValueAt(comment, actualID, 5);
+                                if (command[0].equals("bgColour")) {
+                                    try {
+                                        Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
+                                        colours.put(rowID, colour);
+                                    } catch (NumberFormatException e) {
+                                        // Invalid color format, skip
+                                    }
+                                } else if (command[0].equals("textColour")) {
+                                    try {
+                                        Color colour = Color.decode(api.utilities().urlUtils().decode(command[1]));
+                                        textColours.put(rowID, colour);
+                                    } catch (NumberFormatException e) {
+                                        // Invalid color format, skip
+                                    }
+                                } else if (command[0].equals("comment")) {
+                                    String comment = api.utilities().urlUtils().decode(command[1]);
+                                    int actualID = getRealRowID(rowID);
+                                    if(actualID > -1) {
+                                        model.setValueAt(comment, actualID, 5);
+                                    }
                                 }
                             }
+                            break;
                         }
-                        break;
                     }
                 }
+            } catch (IllegalArgumentException e) {
+                api.logging().logToError("Failed to decode HTTP request for TaboratorCmd: " + e.getMessage());
             }
         }
     }
@@ -683,16 +659,16 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
             textColours = settings.getTextColours();
             readRows = settings.getReadRows();
         } catch(Throwable e) {
-            System.err.println("Error reading settings:"+e);
+            api.logging().logToError("Error reading settings: " + e.getMessage());
         }
     }
-    
+
     private void saveSettings() {
         try {
-            settings.saveSettings(unread, rowNumber, interactionHistory, originalRequests, 
+            settings.saveSettings(unread, rowNumber, interactionHistory, originalRequests,
                                originalResponses, readRows, comments, colours, textColours);
         } catch (Throwable e) {
-            System.err.println("Error saving settings:"+e);
+            api.logging().logToError("Error saving settings: " + e.getMessage());
         }
     }
     private void insertInteractions(List<Interaction> interactions) {
@@ -787,17 +763,14 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         item.setBackground(colour);
         item.setForeground(textColour);
         item.setOpaque(true);
-        item.addActionListener(new ActionListener() {
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                int[] rows = collaboratorTable.getSelectedRows();
-                for(int i=0;i<rows.length;i++) {
-                    int realRow = collaboratorTable.convertRowIndexToModel(rows[i]);
-                    if (realRow > -1) {
-                        int id = (int) collaboratorTable.getModel().getValueAt(realRow, 0);
-                        colours.put(id, colour);
-                        textColours.put(id, textColour);
-                    }
+        item.addActionListener(e -> {
+            int[] rows = collaboratorTable.getSelectedRows();
+            for (int row : rows) {
+                int realRow = collaboratorTable.convertRowIndexToModel(row);
+                if (realRow > -1) {
+                    int id = (int) collaboratorTable.getModel().getValueAt(realRow, 0);
+                    colours.put(id, colour);
+                    textColours.put(id, textColour);
                 }
             }
         });
@@ -836,7 +809,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         byte[] request = requestToBeSent.toByteArray().getBytes();
         if (api.utilities().byteUtils().indexOf(request, api.utilities().byteUtils().convertFromString(COLLABORATOR_PLACEHOLDER), true, 0, request.length) > -1) {
             String requestStr = api.utilities().byteUtils().convertToString(request);
-            Matcher m = Pattern.compile(COLLABORATOR_PLACEHOLDER.replace("$", "\\$")).matcher(requestStr);
+            Matcher m = COLLABORATOR_PLACEHOLDER_PATTERN.matcher(requestStr);
             ArrayList<String> collaboratorPayloads = new ArrayList<>();
             while (m.find()) {
                 String collaboratorPayloadID = collaborator.generatePayload().id().toString();
@@ -968,21 +941,26 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
 
     private String getHostnameFromInteraction(HashMap<String, String> interaction) {
         String fallback = interaction.get("interaction_id") + "." + collaborator.server().address();
-        switch(interaction.get("type")) {
-            case "DNS":
-                return getHostnameFromDnsRequest(Base64.getDecoder().decode(interaction.get("raw_query")), fallback);
-            case "HTTP":
-                return getHostnameFromHttpRequest(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("request"))), fallback);
-            case "SMTP":
-                return getHostnameFromSmtpConversation(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("conversation"))), fallback);
-            default:
-                return fallback;
+        try {
+            switch(interaction.get("type")) {
+                case "DNS":
+                    return getHostnameFromDnsRequest(Base64.getDecoder().decode(interaction.get("raw_query")), fallback);
+                case "HTTP":
+                    return getHostnameFromHttpRequest(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("request"))), fallback);
+                case "SMTP":
+                    return getHostnameFromSmtpConversation(api.utilities().byteUtils().convertToString(Base64.getDecoder().decode(interaction.get("conversation"))), fallback);
+                default:
+                    return fallback;
+            }
+        } catch (IllegalArgumentException e) {
+            api.logging().logToError("Failed to decode Base64 data for interaction: " + e.getMessage());
+            return fallback;
         }
     }
 
     private static String getHostnameFromDnsRequest(byte[] rawQuery, String fallback) {
         StringBuilder hostname = new StringBuilder();
-        HashSet<Integer> seenPtrs = new HashSet<Integer>();
+        HashSet<Integer> seenPtrs = new HashSet<>();
 
         ByteBuffer bb = ByteBuffer.wrap(rawQuery);
 
@@ -1065,11 +1043,10 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
 
     private static String getHostnameFromSmtpConversation(String conversation, String fallback) {
         String[] lines = conversation.split("\r\n");
-        Pattern bracketedAddressPat = Pattern.compile("<(.*)>");
         for (String line : lines) {
             if (line.toLowerCase(Locale.ROOT).startsWith("rcpt to:")) {
                 String recipient = line.split(":", 2)[1].trim();
-                Matcher m = bracketedAddressPat.matcher(recipient);
+                Matcher m = BRACKETED_ADDRESS_PATTERN.matcher(recipient);
                 if (m.find()) {
                     // Parsing email addresses is hard but hopefully we've just found a bracketed email address
                     // e.g. <peter@example.com>
@@ -1140,7 +1117,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                     outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
                     modifiedRequest = outputStream.toByteArray();
                 } catch (Exception ex) {
-                    stderr.println("Error inserting text at selection: " + ex.getMessage());
+                    api.logging().logToError("Error inserting text at selection: " + ex.getMessage());
                     // Fallback: copy to clipboard
                     Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
                     return;
@@ -1160,7 +1137,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                     outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
                     modifiedRequest = outputStream.toByteArray();
                 } catch (Exception ex) {
-                    stderr.println("Error inserting text at cursor position: " + ex.getMessage());
+                    api.logging().logToError("Error inserting text at cursor position: " + ex.getMessage());
                     // Fallback: copy to clipboard
                     Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
                     return;
@@ -1196,7 +1173,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                     outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
                     modifiedRequest = outputStream.toByteArray();
                 } catch (Exception ex) {
-                    stderr.println("Error inserting text at selection: " + ex.getMessage());
+                    api.logging().logToError("Error inserting text at selection: " + ex.getMessage());
                     // Fallback: copy to clipboard
                     Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
                     return;
@@ -1216,7 +1193,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
                     outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
                     modifiedRequest = outputStream.toByteArray();
                 } catch (Exception ex) {
-                    stderr.println("Error inserting text at cursor position: " + ex.getMessage());
+                    api.logging().logToError("Error inserting text at cursor position: " + ex.getMessage());
                     // Fallback: copy to clipboard
                     Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
                     return;
@@ -1248,12 +1225,13 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         insertTextIntoEditor(event, insertText);
     }
 
-    // Extension cleanup is handled automatically by Montoya API
     public void extensionUnloaded() {
         shutdown = true;
         running = false;
-        stdout.println(extensionName + " unloaded");
-        pollThread.interrupt();
+        api.logging().logToOutput(extensionName + " unloaded");
+        if (pollThread != null) {
+            pollThread.interrupt();
+        }
         saveSettings();
     }
 

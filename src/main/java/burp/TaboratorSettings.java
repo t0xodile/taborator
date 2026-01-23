@@ -10,6 +10,7 @@ import java.awt.Color;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Map;
 
 public class TaboratorSettings {
     private final MontoyaApi api;
@@ -24,14 +25,14 @@ public class TaboratorSettings {
         this.preferences = api.persistence().preferences();
     }
 
-    public void saveSettings(int unread, int rowNumber, 
-                           HashMap<Integer, HashMap<String, String>> interactionHistory,
-                           HashMap<String, HashMap<String, String>> originalRequests,
-                           HashMap<String, String> originalResponses,
+    public void saveSettings(int unread, int rowNumber,
+                           Map<Integer, HashMap<String, String>> interactionHistory,
+                           Map<String, HashMap<String, String>> originalRequests,
+                           Map<String, String> originalResponses,
                            ArrayList<Integer> readRows,
-                           HashMap<Integer, String> comments,
-                           HashMap<Integer, Color> colours,
-                           HashMap<Integer, Color> textColours) {
+                           Map<Integer, String> comments,
+                           Map<Integer, Color> colours,
+                           Map<Integer, Color> textColours) {
         try {
             // Save to extension data (project-specific)
             extensionData.setInteger("unread", unread);
@@ -46,13 +47,13 @@ public class TaboratorSettings {
             
             // Colors need special handling since they're not JSON serializable by default
             HashMap<Integer, String> colorStrings = new HashMap<>();
-            for (HashMap.Entry<Integer, Color> entry : colours.entrySet()) {
+            for (Map.Entry<Integer, Color> entry : colours.entrySet()) {
                 colorStrings.put(entry.getKey(), String.format("#%06x", entry.getValue().getRGB() & 0xFFFFFF));
             }
             extensionData.setString("colours", gson.toJson(colorStrings));
-            
+
             HashMap<Integer, String> textColorStrings = new HashMap<>();
-            for (HashMap.Entry<Integer, Color> entry : textColours.entrySet()) {
+            for (Map.Entry<Integer, Color> entry : textColours.entrySet()) {
                 textColorStrings.put(entry.getKey(), String.format("#%06x", entry.getValue().getRGB() & 0xFFFFFF));
             }
             extensionData.setString("textColours", gson.toJson(textColorStrings));
