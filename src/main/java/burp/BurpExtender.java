@@ -28,6 +28,7 @@ import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.text.JTextComponent;
 import javax.swing.table.TableModel;
 import javax.swing.table.TableRowSorter;
 import java.awt.*;
@@ -1115,122 +1116,97 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         return menu;
     }
     
+    private JTextComponent findEditorTextComponent(Object event) {
+        // Get the source component from the input event that triggered the context menu / hotkey.
+        // This is more reliable than KeyboardFocusManager because focus shifts to the popup menu.
+        Component source = null;
+        if (event instanceof ContextMenuEvent) {
+            source = ((ContextMenuEvent) event).inputEvent().getComponent();
+        } else if (event instanceof HotKeyEvent) {
+            source = ((HotKeyEvent) event).inputEvent().getComponent();
+        }
+
+        if (source instanceof JTextComponent) {
+            return (JTextComponent) source;
+        }
+
+        // Walk down the component tree to find a JTextComponent child
+        if (source instanceof Container) {
+            return findTextComponentIn((Container) source);
+        }
+        return null;
+    }
+
+    private JTextComponent findTextComponentIn(Container container) {
+        for (Component child : container.getComponents()) {
+            if (child instanceof JTextComponent) {
+                return (JTextComponent) child;
+            }
+            if (child instanceof Container) {
+                JTextComponent found = findTextComponentIn((Container) child);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
     private void insertTextIntoEditor(Object event, String textToInsert) {
-        // Handle message editor context (like Repeater request tab)
+        // Try to insert directly into the Swing text component via the input event source.
+        // This avoids setRequest() which replaces the entire content and resets scroll position.
+        JTextComponent textComponent = findEditorTextComponent(event);
+        if (textComponent != null) {
+            // replaceSelection handles both cases:
+            // - If text is selected, it replaces the selection
+            // - If no text is selected, it inserts at the caret position
+            textComponent.replaceSelection(textToInsert);
+            return;
+        }
+
+        // Fallback: use the Montoya API setRequest() approach
         if (event instanceof ContextMenuEvent && ((ContextMenuEvent) event).messageEditorRequestResponse().isPresent()) {
             var messageEditor = ((ContextMenuEvent) event).messageEditorRequestResponse().get();
-            
-            // Get current request
-            var currentRequest = messageEditor.requestResponse().request();
-            var currentRequestBytes = currentRequest.toByteArray().getBytes();
-            
-            // Check if there's a selection
-            var selection = messageEditor.selectionOffsets();
-            byte[] modifiedRequest;
-            
-            if (selection.isPresent() && selection.get().startIndexInclusive() != selection.get().endIndexExclusive()) {
-                // There's actual selected text - replace it
-                var selectionRange = selection.get();
-                int startOffset = selectionRange.startIndexInclusive();
-                int endOffset = selectionRange.endIndexExclusive();
-                
-                // Create new request with text inserted/replaced
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, startOffset));
-                    outputStream.write(textToInsert.getBytes());
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
-                    modifiedRequest = outputStream.toByteArray();
-                } catch (Exception ex) {
-                    api.logging().logToError("Error inserting text at selection: " + ex.getMessage());
-                    // Fallback: copy to clipboard
-                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
-                    return;
-                }
-            } else {
-                // No selection or empty selection - insert at cursor position
-                int caretPosition = messageEditor.caretPosition();
-                
-                // Make sure caret position is within bounds
-                if (caretPosition < 0) caretPosition = 0;
-                if (caretPosition > currentRequestBytes.length) caretPosition = currentRequestBytes.length;
-                
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, caretPosition));
-                    outputStream.write(textToInsert.getBytes());
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
-                    modifiedRequest = outputStream.toByteArray();
-                } catch (Exception ex) {
-                    api.logging().logToError("Error inserting text at cursor position: " + ex.getMessage());
-                    // Fallback: copy to clipboard
-                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
-                    return;
-                }
-            }
-            
-            // Create new request and set it back
-            var newRequest = HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest));
-            messageEditor.setRequest(newRequest);
-            
+            byte[] modifiedRequest = buildModifiedRequest(messageEditor, textToInsert);
+            if (modifiedRequest == null) return;
+            messageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest)));
+
         } else if (event instanceof HotKeyEvent && ((HotKeyEvent) event).messageEditorRequestResponse().isPresent()) {
             var messageEditor = ((HotKeyEvent) event).messageEditorRequestResponse().get();
-            
-            // Get current request
-            var currentRequest = messageEditor.requestResponse().request();
-            var currentRequestBytes = currentRequest.toByteArray().getBytes();
-            
-            // Check if there's a selection
-            var selection = messageEditor.selectionOffsets();
-            byte[] modifiedRequest;
-            
+            byte[] modifiedRequest = buildModifiedRequest(messageEditor, textToInsert);
+            if (modifiedRequest == null) return;
+            messageEditor.setRequest(HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest)));
+
+        } else {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+        }
+    }
+
+    private byte[] buildModifiedRequest(
+            burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse messageEditor,
+            String textToInsert) {
+        var currentRequestBytes = messageEditor.requestResponse().request().toByteArray().getBytes();
+        var selection = messageEditor.selectionOffsets();
+
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        try {
             if (selection.isPresent() && selection.get().startIndexInclusive() != selection.get().endIndexExclusive()) {
-                // There's actual selected text - replace it
-                var selectionRange = selection.get();
-                int startOffset = selectionRange.startIndexInclusive();
-                int endOffset = selectionRange.endIndexExclusive();
-                
-                // Create new request with text inserted/replaced
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, startOffset));
-                    outputStream.write(textToInsert.getBytes());
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
-                    modifiedRequest = outputStream.toByteArray();
-                } catch (Exception ex) {
-                    api.logging().logToError("Error inserting text at selection: " + ex.getMessage());
-                    // Fallback: copy to clipboard
-                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
-                    return;
-                }
+                int startOffset = selection.get().startIndexInclusive();
+                int endOffset = selection.get().endIndexExclusive();
+                outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, startOffset));
+                outputStream.write(textToInsert.getBytes());
+                outputStream.write(Arrays.copyOfRange(currentRequestBytes, endOffset, currentRequestBytes.length));
             } else {
-                // No selection or empty selection - insert at cursor position
                 int caretPosition = messageEditor.caretPosition();
-                
-                // Make sure caret position is within bounds
                 if (caretPosition < 0) caretPosition = 0;
                 if (caretPosition > currentRequestBytes.length) caretPosition = currentRequestBytes.length;
-                
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                try {
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, caretPosition));
-                    outputStream.write(textToInsert.getBytes());
-                    outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
-                    modifiedRequest = outputStream.toByteArray();
-                } catch (Exception ex) {
-                    api.logging().logToError("Error inserting text at cursor position: " + ex.getMessage());
-                    // Fallback: copy to clipboard
-                    Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
-                    return;
-                }
+                outputStream.write(Arrays.copyOfRange(currentRequestBytes, 0, caretPosition));
+                outputStream.write(textToInsert.getBytes());
+                outputStream.write(Arrays.copyOfRange(currentRequestBytes, caretPosition, currentRequestBytes.length));
             }
-            
-            // Create new request and set it back
-            var newRequest = HttpRequest.httpRequest(ByteArray.byteArray(modifiedRequest));
-            messageEditor.setRequest(newRequest);
-        } else {
-            // Fallback: copy to clipboard for other contexts
+            return outputStream.toByteArray();
+        } catch (Exception ex) {
+            api.logging().logToError("Error inserting text: " + ex.getMessage());
             Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(textToInsert), null);
+            return null;
         }
     }
 
