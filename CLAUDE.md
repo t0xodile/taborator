@@ -5,8 +5,8 @@ This is a Burp Suite Extension that adds a new "taborator" tab. This tab is like
 ## Architecture
 
 - **Main Entry Point**: `src/main/java/burp/BurpExtender.java` - implements `BurpExtension` interface
-- **Build System**: Gradle with Kotlin DSL, Java 21 compatibility
-- **Dependencies**: Montoya API 2025.12 (compile-only), no runtime dependencies
+- **Build System**: Gradle with Groovy DSL, Java 11 compatibility
+- **Dependencies**: Montoya API 2025.12 (compile-only), Gson 2.8.5 (runtime, bundled in fat JAR)
 - **Extension Pattern**: Single-class extension that initializes through `initialize(MontoyaApi montoyaApi)` method
 
 ## Key Development Commands

@@ -93,8 +93,7 @@ public class BurpExtender implements BurpExtension, HttpHandler, ContextMenuItem
         api.http().registerHttpHandler(this);
         api.userInterface().registerContextMenuItemsProvider(this);
         
-        // Register hotkeys for command palette
-
+        // Register hotkeys for command palette - the actual keys are irrelevant, just want them in command pallet.
         HotKey insertCollabPayload = HotKey.hotKey("Insert Collaborator Payload", "Ctrl+Shift+Alt+C");
 
         HotKeyHandler insertCollabPayloadHandler = event -> event.messageEditorRequestResponse().ifPresent(editor -> {
